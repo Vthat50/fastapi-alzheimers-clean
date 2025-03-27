@@ -8,6 +8,9 @@ import numpy as np
 import nibabel as nib
 import subprocess
 import uuid
+import zipfile
+import requests
+from pathlib import Path
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
@@ -24,9 +27,30 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ✅ Download + unzip model from S3 if needed
+def download_model_from_s3():
+    model_zip_path = "roberta_final_checkpoint.zip"
+    extract_path = "roberta_final_checkpoint"
+
+    if not Path(extract_path).exists():
+        print("Downloading model...")
+        url = os.getenv("S3_MODEL_URL")
+        if not url:
+            raise RuntimeError("S3_MODEL_URL environment variable is not set.")
+        r = requests.get(url)
+        with open(model_zip_path, "wb") as f:
+            f.write(r.content)
+
+        print("Unzipping model...")
+        with zipfile.ZipFile(model_zip_path, 'r') as zip_ref:
+            zip_ref.extractall(extract_path)
+        print("Model ready.")
+
+download_model_from_s3()
+
 # ✅ Hugging Face model path
 model_path = "./roberta_final_checkpoint"
-# ✅ Load model + tokenizer directly from Hugging Face Hub
+# ✅ Load model + tokenizer directly from local
 tokenizer = AutoTokenizer.from_pretrained(model_path)
 model = AutoModelForSequenceClassification.from_pretrained(model_path)
 model.eval()
@@ -84,7 +108,6 @@ async def process_mri(file: UploadFile = File(...)):
         hippo_vol = (volumes.get("Left-Hippocampus", 0) + volumes.get("Right-Hippocampus", 0)) / 2
         ventricle_vol = (volumes.get("Left-Lateral-Ventricle", 0) + volumes.get("Right-Lateral-Ventricle", 0))
 
-        # Simulated cortical thickness and WM hypo values
         cortical_thickness = round(np.random.uniform(0.2, 3.5), 2)
         wm_hypo_volume = round(np.random.uniform(8e6, 2.5e7), 2)
 
@@ -171,4 +194,5 @@ async def process_mri(file: UploadFile = File(...)):
 
 @app.get("/")
 def root():
-    return {"message": "✅ MRI Risk Prediction API is live using Hugging Face!"}
+    return {"message": "✅ MRI Risk Prediction API is live using local model checkpoint from S3!"}
+
