@@ -23,33 +23,32 @@ app.add_middleware(
 
 logging.basicConfig(level=logging.DEBUG)
 
-# === Load OpenAI API key securely ===
-OPENAI_API_KEY = os.environ.get("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")
+# === OPENAI Setup ===
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
-    raise ValueError("❌ OPENAI_API_KEY environment variable is not set!")
+    raise ValueError("❌ OPENAI_API_KEY not set in environment variables.")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# === Download model from S3 ===
+# === Model Download from Public S3 ===
 def download_model_zip():
     model_folder = "roberta_final_checkpoint"
     zip_path = "roberta_final_checkpoint.zip"
+
+    logging.info("⬇️ Downloading model zip from public S3 URL...")
     url = "https://fastapi-app-bucket-varsh.s3.amazonaws.com/roberta_final_checkpoint.zip"
-
-    if os.path.exists(model_folder):
-        return
-
-    logging.info("⬇️ Downloading model zip...")
     urllib.request.urlretrieve(url, zip_path)
 
     logging.info("📦 Unzipping model...")
     with zipfile.ZipFile(zip_path, 'r') as zip_ref:
         zip_ref.extractall("tmp_unzip")
+
     os.remove(zip_path)
 
-    for root, _, files in os.walk("tmp_unzip"):
+    for root, dirs, files in os.walk("tmp_unzip"):
         if "config.json" in files:
             shutil.move(root, model_folder)
             break
+
     shutil.rmtree("tmp_unzip", ignore_errors=True)
 
     config_path = os.path.join(model_folder, "config.json")
@@ -57,7 +56,7 @@ def download_model_zip():
 
 download_model_zip()
 
-# === Load model ===
+# === Load Model ===
 model_path = "roberta_final_checkpoint"
 tokenizer = AutoTokenizer.from_pretrained(model_path)
 model = AutoModelForSequenceClassification.from_pretrained(model_path)
@@ -65,10 +64,10 @@ model.eval()
 
 label_mapping = {0: "Low Risk", 1: "Medium Risk", 2: "High Risk"}
 
-# === Volume extraction ===
-def parse_aseg_stats(path):
+# === MRI Volume Extraction ===
+def parse_aseg_stats(stats_path):
     left_vol = right_vol = None
-    with open(path, "r") as f:
+    with open(stats_path, "r") as f:
         for line in f:
             if "Left-Hippocampus" in line:
                 left_vol = float(line.split()[3])
@@ -76,9 +75,9 @@ def parse_aseg_stats(path):
                 right_vol = float(line.split()[3])
     return {"Left": left_vol, "Right": right_vol} if left_vol and right_vol else None
 
-def handle_other_mri_formats(path):
+def handle_other_mri_formats(file_path):
     try:
-        img = nib.load(path)
+        img = nib.load(file_path)
         data = img.get_fdata()
         left_roi = data[30:50, 40:60, 20:40]
         right_roi = data[60:80, 40:60, 20:40]
@@ -89,24 +88,24 @@ def handle_other_mri_formats(path):
         logging.error(f"❌ NIfTI parse failed: {e}")
         return None
 
-# === Risk calculation ===
-def compute_ground_truth_risk(vol):
-    avg = (vol["Left"] + vol["Right"]) / 2
+# === Risk Mapping ===
+def compute_ground_truth_risk(volumes):
+    avg = (volumes["Left"] + volumes["Right"]) / 2
     return "Low Risk" if avg >= 3400 else "Medium Risk" if avg >= 2900 else "High Risk"
 
-def compute_mmse_value(vol):
-    avg = (vol["Left"] + vol["Right"]) / 2
+def compute_mmse_value(volumes):
+    avg = (volumes["Left"] + volumes["Right"]) / 2
     return 29 if avg >= 3400 else 26 if avg >= 2900 else 22 if avg >= 2500 else 20
 
 def calculate_accuracy(pred, true):
     return "100%" if pred == true else "0%"
 
-def generate_medical_report(vol):
+def generate_medical_report(volumes):
     prompt = f"""
     You are an AI neurologist analyzing MRI biomarkers for Alzheimer's.
 
-    **Left Volume:** {vol['Left']} mm³
-    **Right Volume:** {vol['Right']} mm³
+    **Left Volume:** {volumes['Left']} mm³
+    **Right Volume:** {volumes['Right']} mm³
 
     Provide:
     - Risk level
@@ -121,7 +120,7 @@ def generate_medical_report(vol):
     )
     return response.choices[0].message.content.strip()
 
-# === /process-mri/ ===
+# === FastAPI Route ===
 @app.post("/process-mri/")
 async def process_mri(file: UploadFile = File(...)):
     try:
@@ -143,9 +142,8 @@ async def process_mri(file: UploadFile = File(...)):
         ground_truth = compute_ground_truth_risk(volumes)
         input_text = f"MMSE score is {mmse}."
         tokens = tokenizer(input_text, return_tensors="pt")
-        with torch.no_grad():
-            logits = model(**tokens).logits
-            probs = torch.softmax(logits, dim=1).detach().numpy()[0]
+        logits = model(**tokens).logits
+        probs = torch.softmax(logits, dim=1).detach().numpy()[0]
         predicted_risk = label_mapping[int(np.argmax(probs))]
 
         return {
@@ -166,8 +164,8 @@ async def process_mri(file: UploadFile = File(...)):
         logging.error(f"❌ Error: {str(e)}", exc_info=True)
         return {"detail": f"Error => {str(e)}"}
 
-# === Root route ===
 @app.get("/")
 def root():
-    return {"message": "✅ API is up. Upload .stats, .nii, or .nii.gz for MMSE risk prediction."}
+    return {"message": "✅ RoBERTa MMSE Risk Prediction API is running! Supports .stats, .nii, and .nii.gz."}
+
 
