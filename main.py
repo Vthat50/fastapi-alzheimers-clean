@@ -1,4 +1,3 @@
-
 import logging
 import os
 import shutil
@@ -183,7 +182,7 @@ def generate_medical_report(volumes):
 @app.post("/process-mri/")
 async def process_mri(file: UploadFile = File(...)):
     try:
-        file_path = os.path.join("/home/ec2-user/uploads", file.filename)
+        file_path = os.path.join("/tmp", file.filename)
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
