@@ -8,6 +8,7 @@ import numpy as np
 import nibabel as nib
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from openai import OpenAI
 
@@ -15,7 +16,7 @@ from openai import OpenAI
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://nurodot-com.webflow.io"],  # ✅ Webflow frontend domain
+    allow_origins=["https://nurodot-com.webflow.io"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -73,10 +74,7 @@ def parse_aseg_stats(stats_path):
                 left_vol = float(line.split()[3])
             if "Right-Hippocampus" in line:
                 right_vol = float(line.split()[3])
-    return {
-        "Left": float(left_vol) if left_vol else None,
-        "Right": float(right_vol) if right_vol else None,
-    } if left_vol and right_vol else None
+    return {"Left": float(left_vol), "Right": float(right_vol)} if left_vol and right_vol else None
 
 def handle_other_mri_formats(file_path):
     try:
@@ -84,11 +82,11 @@ def handle_other_mri_formats(file_path):
         data = img.get_fdata()
         left_roi = data[30:50, 40:60, 20:40]
         right_roi = data[60:80, 40:60, 20:40]
-        left_vol = float(np.sum(left_roi > np.percentile(left_roi, 95)) * np.prod(img.header.get_zooms()))
-        right_vol = float(np.sum(right_roi > np.percentile(right_roi, 95)) * np.prod(img.header.get_zooms()))
+        left_vol = np.sum(left_roi > np.percentile(left_roi, 95)) * np.prod(img.header.get_zooms())
+        right_vol = np.sum(right_roi > np.percentile(right_roi, 95)) * np.prod(img.header.get_zooms())
         return {
-            "Left": round(left_vol, 2),
-            "Right": round(right_vol, 2)
+            "Left": float(round(left_vol, 2)),
+            "Right": float(round(right_vol, 2))
         }
     except Exception as e:
         logging.error(f"❌ NIfTI parse failed: {e}")
@@ -106,27 +104,70 @@ def compute_mmse_value(volumes):
 def calculate_accuracy(pred, true):
     return "100%" if pred == true else "0%"
 
+# === Medical Report with Diagnostics ===
 def generate_medical_report(volumes):
     prompt = f"""
-    You are an AI neurologist analyzing MRI biomarkers for Alzheimer's.
+You are an expert AI neurologist assisting in Alzheimer's risk analysis.
 
-    **Left Volume:** {volumes['Left']} mm³  
-    **Right Volume:** {volumes['Right']} mm³
+A patient's MRI scan reveals hippocampal volumes as follows:
+- Left Volume: {volumes['Left']} mm³
+- Right Volume: {volumes['Right']} mm³
 
-    Provide:
-    - Risk level
-    - Neurodegeneration signs
-    - Progression timeline
-    - Recommended treatments
+Based on these values, provide a comprehensive clinical report including the following:
+
+---
+
+### 🧠 1. Clinical Summary:
+- Brief overview of the volumes and what they imply about hippocampal atrophy.
+- Highlight any asymmetry or abnormalities.
+
+### ⚠️ 2. Risk Level Assessment:
+- Classify Alzheimer's risk: Low / Medium / High.
+- Justify this risk score based on volume and typical clinical patterns.
+
+### 🧬 3. Signs of Neurodegeneration:
+- Describe what these hippocampal volumes suggest about the patient's current stage of neurodegeneration.
+- Compare to typical atrophy levels in MCI vs. AD.
+
+### 🗓️ 4. Progression Timeline:
+- Estimate how advanced the disease may be.
+- Mention if symptoms are likely to be mild, moderate, or severe.
+
+### 💊 5. Recommended Medical Treatments:
+- Provide a bulleted list of medications or medical interventions.
+- Mention if combination therapies are advisable.
+
+### 🧘‍♀️ 6. Lifestyle and Cognitive Care:
+- Recommend lifestyle habits or routines that could help preserve cognitive function.
+
+### 🧪 7. Recommended Diagnostic Tests:
+- Suggest specific next-step diagnostic tests to confirm or rule out Alzheimer’s.
+- This may include: 
+  - PET scan (amyloid/tau)
+  - CSF analysis
+  - Neuropsychological cognitive assessments
+  - Genetic testing (e.g., APOE ε4)
+  - Repeat MRI in 6-12 months for atrophy monitoring
+
+### 📋 8. Follow-up Plan:
+- Describe how soon the patient should see a neurologist or memory care clinic.
+- Suggest monitoring frequency or referral for comprehensive workup.
+
+### ⚠️ 9. Clinical Disclaimer:
+- Make it clear that this is an AI-generated summary and not a substitute for professional medical evaluation.
+
+---
+
+Format everything in professional **Markdown**. Use clear section headers and concise bullet points. Avoid jargon where possible.
     """
     response = client.chat.completions.create(
         model="gpt-4-turbo",
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=1200,
+        max_tokens=1600,
     )
     return response.choices[0].message.content.strip()
 
-# === FastAPI Route ===
+# === MRI Upload Endpoint ===
 @app.post("/process-mri/")
 async def process_mri(file: UploadFile = File(...)):
     try:
@@ -153,15 +194,12 @@ async def process_mri(file: UploadFile = File(...)):
         predicted_risk = label_mapping[int(np.argmax(probs))]
 
         return {
-            "MRI Biomarkers": {
-                "Left": float(volumes["Left"]),
-                "Right": float(volumes["Right"]),
-            },
+            "MRI Biomarkers": volumes,
             "MMSE Value": float(mmse),
             "Model Probabilities": {
                 "Low Risk": float(round(probs[0], 4)),
                 "Medium Risk": float(round(probs[1], 4)),
-                "High Risk": float(round(probs[2], 4)),
+                "High Risk": float(round(probs[2], 4))
             },
             "Predicted Risk": predicted_risk,
             "Ground Truth Risk": ground_truth,
@@ -173,8 +211,33 @@ async def process_mri(file: UploadFile = File(...)):
         logging.error(f"❌ Error: {str(e)}", exc_info=True)
         return {"detail": f"Error => {str(e)}"}
 
+# === Cognitive Test Scoring Endpoint ===
+class CognitiveTestInput(BaseModel):
+    patient_name: str
+    test_type: str  # MMSE or MoCA
+    score: int
+
+@app.post("/analyze-cognitive-score/")
+def analyze_cognitive_score(data: CognitiveTestInput):
+    prompt = f"""
+    A patient named {data.patient_name} has completed a {data.test_type} test and scored {data.score}.
+
+    Please analyze:
+    1. What this score indicates in terms of cognitive health.
+    2. What cognitive domains might be affected.
+    3. Recommendations for next steps, further evaluation or follow-ups.
+    4. What this may suggest in terms of Alzheimer's or related risk.
+
+    Format the output like a medical summary with subheadings.
+    """
+    response = client.chat.completions.create(
+        model="gpt-4-turbo",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=800,
+    )
+    return {"report": response.choices[0].message.content.strip()}
+
+# === Root Endpoint ===
 @app.get("/")
 def root():
-    return {
-        "message": "✅ RoBERTa MMSE Risk Prediction API is running! Supports .stats, .nii, and .nii.gz."
-    }
+    return {"message": "✅ Alzheimer's Risk Prediction API is running. MRI + Cognitive Test Ready."}
