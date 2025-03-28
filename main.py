@@ -15,7 +15,7 @@ from openai import OpenAI
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://nurodot-com.webflow.io"],  # ✅ Webflow frontend domain
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -167,5 +167,3 @@ async def process_mri(file: UploadFile = File(...)):
 @app.get("/")
 def root():
     return {"message": "✅ RoBERTa MMSE Risk Prediction API is running! Supports .stats, .nii, and .nii.gz."}
-
-
