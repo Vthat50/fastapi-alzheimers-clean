@@ -6,17 +6,41 @@ import pandas as pd
 import torch
 import numpy as np
 import nibabel as nib
-import subprocess
-import uuid
 import zipfile
-import requests
-from pathlib import Path
+import boto3
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from openai import OpenAI
+############################################################
+# DOWNLOAD MODEL FROM S3
+############################################################
+def download_model_from_s3():
+    model_dir = "roberta_final_checkpoint"
+    zip_path = "roberta_final_checkpoint.zip"
+    bucket_name = "fastapi-app-bucket-varsh"
+    object_key = "roberta_final_checkpoint.zip"
 
-# ✅ FastAPI Setup
+    if os.path.exists(model_dir) and os.path.isdir(model_dir) and os.listdir(model_dir):
+        logging.info("✅ Model already extracted, skipping download.")
+        return
+
+    logging.info("⬇️ Downloading model zip from S3...")
+    s3 = boto3.client("s3")
+    s3.download_file(bucket_name, object_key, zip_path)
+
+    if not zipfile.is_zipfile(zip_path):
+        raise ValueError("❌ Downloaded file is not a valid zip file.")
+
+    logging.info("📦 Unzipping model...")
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        zip_ref.extractall(model_dir)
+
+    logging.info("✅ Model successfully downloaded and extracted.")
+
+############################################################
+# FASTAPI SETUP
+############################################################
 app = FastAPI()
 
 app.add_middleware(
@@ -27,37 +51,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ✅ Download + unzip model from S3 if needed
-def download_model_from_s3():
-    model_zip_path = "roberta_final_checkpoint.zip"
-    extract_path = "roberta_final_checkpoint"
+logging.basicConfig(level=logging.INFO)
 
-    if not Path(extract_path).exists():
-        print("Downloading model...")
-        url = os.getenv("S3_MODEL_URL")
-        if not url:
-            raise RuntimeError("S3_MODEL_URL environment variable is not set.")
-        r = requests.get(url)
-        with open(model_zip_path, "wb") as f:
-            f.write(r.content)
+############################################################
+# OPENAI SETUP
+############################################################
+client = OpenAI(api_key="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")
 
-        print("Unzipping model...")
-        with zipfile.ZipFile(model_zip_path, 'r') as zip_ref:
-            zip_ref.extractall(extract_path)
-        print("Model ready.")
-
+############################################################
+# LOAD ROBERTA MODEL
+############################################################
 download_model_from_s3()
-
-# ✅ Hugging Face model path
-model_path = "./roberta_final_checkpoint"
-# ✅ Load model + tokenizer directly from local
+model_path = "roberta_final_checkpoint"
 tokenizer = AutoTokenizer.from_pretrained(model_path)
 model = AutoModelForSequenceClassification.from_pretrained(model_path)
 model.eval()
-
-# ✅ OpenAI Client Setup
-OPENAI_API_KEY = "sk-proj-SuOp_-ILz5hHivnIHRXCgG9MChl9m-6i6YIwxapCadrDiZi7bSn5fhjMDqrtaobw64p4nTLzog"
-client = OpenAI(api_key=OPENAI_API_KEY)
 
 label_mapping = {
     0: "Low Risk",
@@ -65,113 +73,137 @@ label_mapping = {
     2: "High Risk",
 }
 
+############################################################
+# PARSE STATS FILE
+############################################################
+def parse_aseg_stats(stats_path):
+    if not os.path.exists(stats_path):
+        logging.error(f"❌ .stats file not found: {stats_path}")
+        return None
+
+    left_vol = None
+    right_vol = None
+    with open(stats_path, "r") as f:
+        for line in f:
+            if "Left-Hippocampus" in line:
+                left_vol = float(line.split()[3])
+            if "Right-Hippocampus" in line:
+                right_vol = float(line.split()[3])
+
+    if left_vol is None or right_vol is None:
+        logging.error("❌ HPC volumes not found in .stats file.")
+        return None
+
+    return {"Left": left_vol, "Right": right_vol}
+
+############################################################
+# HANDLE NIFTI FILES (.nii or .nii.gz)
+############################################################
+def handle_other_mri_formats(file_path):
+    try:
+        img = nib.load(file_path)
+        data = img.get_fdata()
+
+        left_roi = data[30:50, 40:60, 20:40]
+        right_roi = data[60:80, 40:60, 20:40]
+
+        left_vol = float(np.sum(left_roi > np.percentile(left_roi, 95))) * np.prod(img.header.get_zooms())
+        right_vol = float(np.sum(right_roi > np.percentile(right_roi, 95))) * np.prod(img.header.get_zooms())
+
+        return {"Left": round(left_vol, 2), "Right": round(right_vol, 2)}
+    except Exception as e:
+        logging.error(f"❌ Failed to parse NIfTI file: {str(e)}")
+        return None
+
+############################################################
+# RISK AND MMSE MAPPING
+############################################################
+def compute_ground_truth_risk(volumes):
+    avg_hippo = (volumes["Left"] + volumes["Right"]) / 2
+    if avg_hippo >= 3400:
+        return "Low Risk"
+    elif 2900 <= avg_hippo < 3400:
+        return "Medium Risk"
+    else:
+        return "High Risk"
+
+def compute_mmse_value(volumes):
+    avg_v = (volumes["Left"] + volumes["Right"]) / 2
+    if avg_v >= 3400:
+        return 29
+    elif 2900 <= avg_v < 3400:
+        return 26
+    elif 2500 <= avg_v < 2900:
+        return 22
+    else:
+        return 20
+
+def calculate_accuracy(predicted_risk, ground_truth_risk):
+    return "100%" if predicted_risk == ground_truth_risk else "0%"
+
+############################################################
+# GENERATE REPORT
+############################################################
+def generate_medical_report(volumes):
+    prompt = f"""
+    You are an AI neurologist analyzing MRI biomarkers for Alzheimer's disease.
+
+    **Patient MRI Biomarkers:**
+    - Left Hippocampal Volume: {volumes['Left']} mm³
+    - Right Hippocampal Volume: {volumes['Right']} mm³
+
+    Generate a structured report with:
+    - Risk Level
+    - Key Neurodegeneration Indicators
+    - Estimated Disease Progression Timeline
+    - Treatment Recommendations
+    """
+    response = client.chat.completions.create(
+        model="gpt-4-turbo",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=1500
+    )
+    return response.choices[0].message.content.strip()
+
+############################################################
+# MAIN INFERENCE ROUTE
+############################################################
 @app.post("/process-mri/")
 async def process_mri(file: UploadFile = File(...)):
     try:
-        upload_id = str(uuid.uuid4())
-        upload_dir = f"/home/ec2-user/uploads/{upload_id}"
-        os.makedirs(upload_dir, exist_ok=True)
-        uploaded_path = os.path.join(upload_dir, file.filename)
-
-        with open(uploaded_path, "wb") as buffer:
+        file_path = os.path.join("/home/ec2-user/uploads", file.filename)
+        with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        # Run FastSurfer if not a .stats file
-        if not uploaded_path.endswith(".stats"):
-            fastsurfer_output_dir = os.path.join("/home/ec2-user/fastsurfer_outputs", upload_id)
-            cmd = [
-                "bash", "/home/ec2-user/FastSurfer/run_fastsurfer.sh",
-                "--t1", uploaded_path,
-                "--sid", upload_id,
-                "--sd", "/home/ec2-user/fastsurfer_outputs",
-                "--seg_only"
-            ]
-            subprocess.run(cmd, check=True)
-            stats_path = os.path.join(fastsurfer_output_dir, "stats", "aseg.stats")
+        logging.info(f"✅ File uploaded => {file_path}")
+
+        if file.filename.endswith(".stats"):
+            volumes = parse_aseg_stats(file_path)
+        elif file.filename.endswith(".nii") or file.filename.endswith(".nii.gz"):
+            volumes = handle_other_mri_formats(file_path)
         else:
-            stats_path = uploaded_path
+            return {"detail": "Unsupported MRI file format. Only .stats, .nii, or .nii.gz are supported."}
 
-        def parse_aseg_stats(stats_path):
-            volumes = {}
-            with open(stats_path, "r") as f:
-                for line in f:
-                    parts = line.strip().split()
-                    if len(parts) >= 5 and parts[0] == '#':
-                        continue
-                    if len(parts) > 4:
-                        label = parts[4]
-                        volumes[label] = float(parts[3])
-            return volumes
+        if not volumes:
+            return {"detail": "MRI biomarker extraction failed."}
 
-        volumes = parse_aseg_stats(stats_path)
+        ground_truth = compute_ground_truth_risk(volumes)
+        mmse_val = compute_mmse_value(volumes)
+        logging.info(f"Ground truth => {ground_truth}, mmse={mmse_val}")
 
-        hippo_vol = (volumes.get("Left-Hippocampus", 0) + volumes.get("Right-Hippocampus", 0)) / 2
-        ventricle_vol = (volumes.get("Left-Lateral-Ventricle", 0) + volumes.get("Right-Lateral-Ventricle", 0))
-
-        cortical_thickness = round(np.random.uniform(0.2, 3.5), 2)
-        wm_hypo_volume = round(np.random.uniform(8e6, 2.5e7), 2)
-
-        def compute_mmse():
-            if hippo_vol >= 3400:
-                return 29
-            elif hippo_vol >= 2900:
-                return 26
-            elif hippo_vol >= 2500:
-                return 22
-            else:
-                return 20
-
-        mmse_val = compute_mmse()
         input_text = f"MMSE score is {mmse_val}."
-        tokens = tokenizer(input_text, return_tensors="pt").to(model.device)
-
+        tokens = tokenizer(input_text, return_tensors="pt")
         with torch.no_grad():
             logits = model(**tokens).logits
-            probs = torch.nn.functional.softmax(logits, dim=1).cpu().numpy()[0]
+            probs = torch.nn.functional.softmax(logits, dim=1).numpy()[0]
             predicted_idx = int(np.argmax(probs))
-            confidence = float(np.max(probs))
-            predicted_risk = label_mapping.get(predicted_idx, "Unknown")
+            predicted_risk = label_mapping[predicted_idx]
 
-        def compute_ground_truth():
-            if hippo_vol >= 3400:
-                return "Low Risk"
-            elif hippo_vol >= 2900:
-                return "Medium Risk"
-            else:
-                return "High Risk"
-
-        ground_truth = compute_ground_truth()
-        votes = [predicted_risk, ground_truth]
-        predicted_risk = max(set(votes), key=votes.count)
-
-        def generate_medical_report():
-            prompt = f"""
-            You are an AI neurologist. Analyze the following features:
-            - Cortical Thickness: {cortical_thickness} mm
-            - White Matter Hypointensities: {wm_hypo_volume} mm³
-            - Hippocampal Volume: {hippo_vol} mm³
-            - Ventricle Volume: {ventricle_vol} mm³
-            - MMSE Score: {mmse_val}
-            Provide:
-            - Neurological interpretation
-            - Risk level
-            - Recommended cognitive and neuropsychological tests
-            - Treatment follow-ups
-            """
-            response = client.chat.completions.create(
-                model="gpt-4-turbo",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=1500
-            )
-            return response.choices[0].message.content.strip()
-
-        report = generate_medical_report()
+        accuracy = calculate_accuracy(predicted_risk, ground_truth)
+        medical_report = generate_medical_report(volumes)
 
         return {
-            "Cortical Thickness": cortical_thickness,
-            "White Matter Hypointensities Volume": wm_hypo_volume,
-            "Hippocampal Volume": hippo_vol,
-            "Ventricle Volume": ventricle_vol,
+            "MRI Biomarkers": volumes,
             "MMSE Value": mmse_val,
             "Model Probabilities": {
                 "Low Risk": round(float(probs[0]), 4),
@@ -179,20 +211,20 @@ async def process_mri(file: UploadFile = File(...)):
                 "High Risk": round(float(probs[2]), 4)
             },
             "Predicted Risk": predicted_risk,
-            "Prediction Confidence": round(confidence, 4),
             "Ground Truth Risk": ground_truth,
-            "Accuracy Score": "100%" if predicted_risk == ground_truth else "0%",
-            "Generated Medical Report": report
+            "Accuracy Score": accuracy,
+            "Generated Medical Report": medical_report
         }
 
-    except subprocess.CalledProcessError as e:
-        logging.error(f"FastSurfer failed: {str(e)}")
-        return {"detail": f"FastSurfer failed: {str(e)}"}
     except Exception as e:
-        logging.error(f"Error processing MRI: {str(e)}")
-        return {"detail": f"Error: {str(e)}"}
+        logging.error(f"Error processing file => {str(e)}", exc_info=True)
+        return {"detail": f"Error => {str(e)}"}
 
+############################################################
+# HEALTH CHECK ROUTE
+############################################################
 @app.get("/")
 def root():
-    return {"message": "✅ MRI Risk Prediction API is live using local model checkpoint from S3!"}
+    return {"message": "✅ RoBERTa MMSE Risk Prediction API is running! Supports .stats, .nii, and .nii.gz."}
+
 
