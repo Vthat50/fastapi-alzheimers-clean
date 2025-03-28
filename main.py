@@ -73,7 +73,10 @@ def parse_aseg_stats(stats_path):
                 left_vol = float(line.split()[3])
             if "Right-Hippocampus" in line:
                 right_vol = float(line.split()[3])
-    return {"Left": left_vol, "Right": right_vol} if left_vol and right_vol else None
+    return {
+        "Left": float(left_vol) if left_vol else None,
+        "Right": float(right_vol) if right_vol else None,
+    } if left_vol and right_vol else None
 
 def handle_other_mri_formats(file_path):
     try:
@@ -81,9 +84,12 @@ def handle_other_mri_formats(file_path):
         data = img.get_fdata()
         left_roi = data[30:50, 40:60, 20:40]
         right_roi = data[60:80, 40:60, 20:40]
-        left_vol = np.sum(left_roi > np.percentile(left_roi, 95)) * np.prod(img.header.get_zooms())
-        right_vol = np.sum(right_roi > np.percentile(right_roi, 95)) * np.prod(img.header.get_zooms())
-        return {"Left": round(left_vol, 2), "Right": round(right_vol, 2)}
+        left_vol = float(np.sum(left_roi > np.percentile(left_roi, 95)) * np.prod(img.header.get_zooms()))
+        right_vol = float(np.sum(right_roi > np.percentile(right_roi, 95)) * np.prod(img.header.get_zooms()))
+        return {
+            "Left": round(left_vol, 2),
+            "Right": round(right_vol, 2)
+        }
     except Exception as e:
         logging.error(f"❌ NIfTI parse failed: {e}")
         return None
@@ -104,7 +110,7 @@ def generate_medical_report(volumes):
     prompt = f"""
     You are an AI neurologist analyzing MRI biomarkers for Alzheimer's.
 
-    **Left Volume:** {volumes['Left']} mm³
+    **Left Volume:** {volumes['Left']} mm³  
     **Right Volume:** {volumes['Right']} mm³
 
     Provide:
@@ -147,12 +153,15 @@ async def process_mri(file: UploadFile = File(...)):
         predicted_risk = label_mapping[int(np.argmax(probs))]
 
         return {
-            "MRI Biomarkers": volumes,
-            "MMSE Value": mmse,
+            "MRI Biomarkers": {
+                "Left": float(volumes["Left"]),
+                "Right": float(volumes["Right"]),
+            },
+            "MMSE Value": float(mmse),
             "Model Probabilities": {
-                "Low Risk": round(probs[0], 4),
-                "Medium Risk": round(probs[1], 4),
-                "High Risk": round(probs[2], 4)
+                "Low Risk": float(round(probs[0], 4)),
+                "Medium Risk": float(round(probs[1], 4)),
+                "High Risk": float(round(probs[2], 4)),
             },
             "Predicted Risk": predicted_risk,
             "Ground Truth Risk": ground_truth,
@@ -166,4 +175,6 @@ async def process_mri(file: UploadFile = File(...)):
 
 @app.get("/")
 def root():
-    return {"message": "✅ RoBERTa MMSE Risk Prediction API is running! Supports .stats, .nii, and .nii.gz."}
+    return {
+        "message": "✅ RoBERTa MMSE Risk Prediction API is running! Supports .stats, .nii, and .nii.gz."
+    }
