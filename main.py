@@ -23,35 +23,41 @@ app.add_middleware(
 
 logging.basicConfig(level=logging.DEBUG)
 
-# === OPENAI API Setup (HARDCODED) ===
+# === Load OpenAI API key securely ===
+OPENAI_API_KEY = os.environ.get("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")
+if not OPENAI_API_KEY:
+    raise ValueError("❌ OPENAI_API_KEY environment variable is not set!")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# === Model Download ===
+# === Download model from S3 ===
 def download_model_zip():
     model_folder = "roberta_final_checkpoint"
     zip_path = "roberta_final_checkpoint.zip"
     url = "https://fastapi-app-bucket-varsh.s3.amazonaws.com/roberta_final_checkpoint.zip"
 
-    if not os.path.exists(model_folder):
-        logging.info("⬇️ Downloading model zip from public S3 URL...")
-        urllib.request.urlretrieve(url, zip_path)
+    if os.path.exists(model_folder):
+        return
 
-        logging.info("📦 Unzipping model...")
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            zip_ref.extractall("tmp_unzip")
-        os.remove(zip_path)
+    logging.info("⬇️ Downloading model zip...")
+    urllib.request.urlretrieve(url, zip_path)
 
-        for root, _, files in os.walk("tmp_unzip"):
-            if "config.json" in files:
-                shutil.move(root, model_folder)
-                break
-        shutil.rmtree("tmp_unzip", ignore_errors=True)
+    logging.info("📦 Unzipping model...")
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        zip_ref.extractall("tmp_unzip")
+    os.remove(zip_path)
 
-        assert os.path.exists(os.path.join(model_folder, "config.json")), "❌ config.json not found after unzip!"
+    for root, _, files in os.walk("tmp_unzip"):
+        if "config.json" in files:
+            shutil.move(root, model_folder)
+            break
+    shutil.rmtree("tmp_unzip", ignore_errors=True)
+
+    config_path = os.path.join(model_folder, "config.json")
+    assert os.path.exists(config_path), "❌ config.json not found after unzip!"
 
 download_model_zip()
 
-# === Load Model ===
+# === Load model ===
 model_path = "roberta_final_checkpoint"
 tokenizer = AutoTokenizer.from_pretrained(model_path)
 model = AutoModelForSequenceClassification.from_pretrained(model_path)
@@ -59,20 +65,20 @@ model.eval()
 
 label_mapping = {0: "Low Risk", 1: "Medium Risk", 2: "High Risk"}
 
-# === Helper Functions ===
-def parse_aseg_stats(stats_path):
+# === Volume extraction ===
+def parse_aseg_stats(path):
     left_vol = right_vol = None
-    with open(stats_path, "r") as f:
+    with open(path, "r") as f:
         for line in f:
             if "Left-Hippocampus" in line:
                 left_vol = float(line.split()[3])
-            elif "Right-Hippocampus" in line:
+            if "Right-Hippocampus" in line:
                 right_vol = float(line.split()[3])
     return {"Left": left_vol, "Right": right_vol} if left_vol and right_vol else None
 
-def handle_other_mri_formats(file_path):
+def handle_other_mri_formats(path):
     try:
-        img = nib.load(file_path)
+        img = nib.load(path)
         data = img.get_fdata()
         left_roi = data[30:50, 40:60, 20:40]
         right_roi = data[60:80, 40:60, 20:40]
@@ -83,23 +89,24 @@ def handle_other_mri_formats(file_path):
         logging.error(f"❌ NIfTI parse failed: {e}")
         return None
 
-def compute_ground_truth_risk(volumes):
-    avg = (volumes["Left"] + volumes["Right"]) / 2
+# === Risk calculation ===
+def compute_ground_truth_risk(vol):
+    avg = (vol["Left"] + vol["Right"]) / 2
     return "Low Risk" if avg >= 3400 else "Medium Risk" if avg >= 2900 else "High Risk"
 
-def compute_mmse_value(volumes):
-    avg = (volumes["Left"] + volumes["Right"]) / 2
+def compute_mmse_value(vol):
+    avg = (vol["Left"] + vol["Right"]) / 2
     return 29 if avg >= 3400 else 26 if avg >= 2900 else 22 if avg >= 2500 else 20
 
 def calculate_accuracy(pred, true):
     return "100%" if pred == true else "0%"
 
-def generate_medical_report(volumes):
+def generate_medical_report(vol):
     prompt = f"""
     You are an AI neurologist analyzing MRI biomarkers for Alzheimer's.
 
-    **Left Hippocampal Volume:** {volumes['Left']} mm³
-    **Right Hippocampal Volume:** {volumes['Right']} mm³
+    **Left Volume:** {vol['Left']} mm³
+    **Right Volume:** {vol['Right']} mm³
 
     Provide:
     - Risk level
@@ -114,18 +121,18 @@ def generate_medical_report(volumes):
     )
     return response.choices[0].message.content.strip()
 
-# === API Endpoint ===
+# === /process-mri/ ===
 @app.post("/process-mri/")
 async def process_mri(file: UploadFile = File(...)):
     try:
-        file_path = f"/tmp/{file.filename}"
-        with open(file_path, "wb") as buffer:
+        path = f"/tmp/{file.filename}"
+        with open(path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        if file.filename.endswith(".stats"):
-            volumes = parse_aseg_stats(file_path)
-        elif file.filename.endswith(".nii") or file.filename.endswith(".nii.gz"):
-            volumes = handle_other_mri_formats(file_path)
+        if path.endswith(".stats"):
+            volumes = parse_aseg_stats(path)
+        elif path.endswith(".nii") or path.endswith(".nii.gz"):
+            volumes = handle_other_mri_formats(path)
         else:
             return {"detail": "Unsupported format. Use .stats, .nii, or .nii.gz"}
 
@@ -136,8 +143,9 @@ async def process_mri(file: UploadFile = File(...)):
         ground_truth = compute_ground_truth_risk(volumes)
         input_text = f"MMSE score is {mmse}."
         tokens = tokenizer(input_text, return_tensors="pt")
-        logits = model(**tokens).logits
-        probs = torch.softmax(logits, dim=1).detach().numpy()[0]
+        with torch.no_grad():
+            logits = model(**tokens).logits
+            probs = torch.softmax(logits, dim=1).detach().numpy()[0]
         predicted_risk = label_mapping[int(np.argmax(probs))]
 
         return {
@@ -158,8 +166,8 @@ async def process_mri(file: UploadFile = File(...)):
         logging.error(f"❌ Error: {str(e)}", exc_info=True)
         return {"detail": f"Error => {str(e)}"}
 
+# === Root route ===
 @app.get("/")
 def root():
-    return {"message": "✅ RoBERTa MMSE Risk Prediction API is running! Supports .stats, .nii, and .nii.gz."}
-
+    return {"message": "✅ API is up. Upload .stats, .nii, or .nii.gz for MMSE risk prediction."}
 
