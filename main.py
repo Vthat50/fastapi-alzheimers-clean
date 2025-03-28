@@ -27,11 +27,10 @@ app.add_middleware(
 logging.basicConfig(level=logging.DEBUG)
 
 # === OPENAI API Setup ===
-OPENAI_API_KEY = "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"
+OPENAI_API_KEY ="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"
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # === Model Download ===
-def download_model_zip():
     model_folder = "roberta_final_checkpoint"
     zip_path = "roberta_final_checkpoint.zip"
 
