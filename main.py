@@ -1,13 +1,12 @@
 import logging
 import os
 import shutil
-import json
-import urllib.request
 import zipfile
-import pandas as pd
-import torch
+import urllib.request
 import numpy as np
 import nibabel as nib
+import torch
+import pandas as pd
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
@@ -26,11 +25,12 @@ app.add_middleware(
 
 logging.basicConfig(level=logging.DEBUG)
 
-# === OPENAI API Setup ===
-OPENAI_API_KEY ="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"
+# === OpenAI Setup (Hardcoded for now) ===
+OPENAI_API_KEY = "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"
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# === Model Download ===
+# === Download model zip from S3 if needed ===
+def download_model_zip():
     model_folder = "roberta_final_checkpoint"
     zip_path = "roberta_final_checkpoint.zip"
 
@@ -50,13 +50,10 @@ client = OpenAI(api_key=OPENAI_API_KEY)
             break
 
     shutil.rmtree("tmp_unzip", ignore_errors=True)
+    assert os.path.exists(os.path.join(model_folder, "config.json")), "❌ config.json not found after unzip!"
 
-    config_path = os.path.join(model_folder, "config.json")
-    assert os.path.exists(config_path), "❌ config.json not found after unzip!"
-
+# === Download & Load Model ===
 download_model_zip()
-
-# === Load RoBERTa Model ===
 model_path = "roberta_final_checkpoint"
 tokenizer = AutoTokenizer.from_pretrained(model_path)
 model = AutoModelForSequenceClassification.from_pretrained(model_path)
@@ -64,10 +61,10 @@ model.eval()
 
 label_mapping = {0: "Low Risk", 1: "Medium Risk", 2: "High Risk"}
 
-# === .stats File Parser ===
-def parse_aseg_stats(stats_path):
+# === Helper: Parse .stats ===
+def parse_aseg_stats(path):
     left_vol = right_vol = None
-    with open(stats_path, "r") as f:
+    with open(path, "r") as f:
         for line in f:
             if "Left-Hippocampus" in line:
                 left_vol = float(line.split()[3])
@@ -75,41 +72,42 @@ def parse_aseg_stats(stats_path):
                 right_vol = float(line.split()[3])
     return {"Left": left_vol, "Right": right_vol} if left_vol and right_vol else None
 
-# === .nii or .nii.gz Parser ===
-def handle_other_mri_formats(file_path):
+# === Helper: Parse .nii / .nii.gz ===
+def handle_other_mri_formats(path):
     try:
-        img = nib.load(file_path)
+        img = nib.load(path)
         data = img.get_fdata()
         left_roi = data[30:50, 40:60, 20:40]
         right_roi = data[60:80, 40:60, 20:40]
-        left_vol = np.sum(left_roi > np.percentile(left_roi, 95)) * np.prod(img.header.get_zooms())
-        right_vol = np.sum(right_roi > np.percentile(right_roi, 95)) * np.prod(img.header.get_zooms())
+        zoom = np.prod(img.header.get_zooms())
+        left_vol = np.sum(left_roi > np.percentile(left_roi, 95)) * zoom
+        right_vol = np.sum(right_roi > np.percentile(right_roi, 95)) * zoom
         return {"Left": round(left_vol, 2), "Right": round(right_vol, 2)}
     except Exception as e:
         logging.error(f"❌ NIfTI parse failed: {e}")
         return None
 
 # === Risk Logic ===
-def compute_ground_truth_risk(volumes):
-    avg = (volumes["Left"] + volumes["Right"]) / 2
+def compute_ground_truth_risk(vol):
+    avg = (vol["Left"] + vol["Right"]) / 2
     return "Low Risk" if avg >= 3400 else "Medium Risk" if avg >= 2900 else "High Risk"
 
-def compute_mmse_value(volumes):
-    avg = (volumes["Left"] + volumes["Right"]) / 2
+def compute_mmse_value(vol):
+    avg = (vol["Left"] + vol["Right"]) / 2
     return 29 if avg >= 3400 else 26 if avg >= 2900 else 22 if avg >= 2500 else 20
 
-def calculate_accuracy(pred, true):
-    return "100%" if pred == true else "0%"
+def calculate_accuracy(pred, actual):
+    return "100%" if pred == actual else "0%"
 
-def generate_medical_report(volumes):
+def generate_medical_report(vol):
     prompt = f"""
     You are an AI neurologist analyzing MRI biomarkers for Alzheimer's.
 
-    **Left Volume:** {volumes['Left']} mm³
-    **Right Volume:** {volumes['Right']} mm³
+    **Left Volume:** {vol['Left']} mm³  
+    **Right Volume:** {vol['Right']} mm³  
 
     Provide:
-    - Risk level
+    - Risk Level
     - Neurodegeneration signs
     - Progression timeline
     - Recommended treatments
@@ -117,11 +115,11 @@ def generate_medical_report(volumes):
     response = client.chat.completions.create(
         model="gpt-4-turbo",
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=1200,
+        max_tokens=1000,
     )
     return response.choices[0].message.content.strip()
 
-# === API Route ===
+# === API Endpoint ===
 @app.post("/process-mri/")
 async def process_mri(file: UploadFile = File(...)):
     try:
@@ -143,8 +141,9 @@ async def process_mri(file: UploadFile = File(...)):
         ground_truth = compute_ground_truth_risk(volumes)
         input_text = f"MMSE score is {mmse}."
         tokens = tokenizer(input_text, return_tensors="pt")
-        logits = model(**tokens).logits
-        probs = torch.softmax(logits, dim=1).detach().numpy()[0]  # ✅ FIXED HERE
+        with torch.no_grad():
+            logits = model(**tokens).logits
+            probs = torch.softmax(logits, dim=1).detach().numpy()[0]
         predicted_risk = label_mapping[int(np.argmax(probs))]
 
         return {
@@ -165,7 +164,9 @@ async def process_mri(file: UploadFile = File(...)):
         logging.error(f"❌ Error: {str(e)}", exc_info=True)
         return {"detail": f"Error => {str(e)}"}
 
+# === Healthcheck Route ===
 @app.get("/")
 def root():
     return {"message": "✅ RoBERTa MMSE Risk Prediction API is running! Supports .stats, .nii, and .nii.gz."}
+
 
