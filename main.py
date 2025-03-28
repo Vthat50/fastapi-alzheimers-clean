@@ -29,9 +29,9 @@ app.add_middleware(
 logging.basicConfig(level=logging.DEBUG)
 
 ############################################################
-# OPENAI SETUP
+# OPENAI SETUP (from ENV)
 ############################################################
-OPENAI_API_KEY = "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"
+OPENAI_API_KEY = os.environ[" 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"]
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 ############################################################
