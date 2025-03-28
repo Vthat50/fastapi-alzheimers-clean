@@ -1,3 +1,4 @@
+
 # syntax=docker/dockerfile:1
 
 FROM python:3.9-slim
@@ -14,17 +15,13 @@ RUN apt-get update && \
 COPY requirements.txt ./
 RUN pip install --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt && \
-    pip install awscli
+    pip install awscli boto3
 
 # Copy the rest of the app
 COPY . .
 
-# Download and extract model from S3
-RUN python3 -c "\
-import os, zipfile\n\
-os.system('aws s3 cp s3://fastapi-app-bucket-varsh/roberta_final_checkpoint.zip roberta_final_checkpoint.zip')\n\
-assert zipfile.is_zipfile('roberta_final_checkpoint.zip'), 'Downloaded file is not a valid zip file'\n\
-with zipfile.ZipFile('roberta_final_checkpoint.zip', 'r') as zip_ref:\n    zip_ref.extractall('roberta_final_checkpoint')\n"
+# Create model directory to extract zip into at runtime
+RUN mkdir -p roberta_final_checkpoint
 
 # Expose port
 ENV PORT=8000
