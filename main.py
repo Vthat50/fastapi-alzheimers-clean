@@ -1,4 +1,3 @@
-
 import logging
 import os
 import shutil
@@ -146,7 +145,7 @@ async def process_mri(file: UploadFile = File(...)):
         input_text = f"MMSE score is {mmse}."
         tokens = tokenizer(input_text, return_tensors="pt")
         logits = model(**tokens).logits
-        probs = torch.softmax(logits, dim=1).numpy()[0]
+        probs = torch.softmax(logits, dim=1).detach().numpy()[0]  # ✅ FIXED HERE
         predicted_risk = label_mapping[int(np.argmax(probs))]
 
         return {
@@ -170,6 +169,4 @@ async def process_mri(file: UploadFile = File(...)):
 @app.get("/")
 def root():
     return {"message": "✅ RoBERTa MMSE Risk Prediction API is running! Supports .stats, .nii, and .nii.gz."}
-
-
 
