@@ -1,4 +1,3 @@
-
 # syntax=docker/dockerfile:1
 
 FROM python:3.9-slim
@@ -20,7 +19,7 @@ RUN pip install --upgrade pip && \
 # Copy the rest of the app
 COPY . .
 
-# Create model directory to extract zip into at runtime
+# Create model directory to be populated at runtime
 RUN mkdir -p roberta_final_checkpoint
 
 # Expose port
