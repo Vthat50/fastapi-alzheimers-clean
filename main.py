@@ -1,3 +1,4 @@
+
 import logging
 import os
 import shutil
@@ -6,37 +7,10 @@ import pandas as pd
 import torch
 import numpy as np
 import nibabel as nib
-import zipfile
-import boto3
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from openai import OpenAI
-############################################################
-# DOWNLOAD MODEL FROM S3
-############################################################
-def download_model_from_s3():
-    model_dir = "roberta_final_checkpoint"
-    zip_path = "roberta_final_checkpoint.zip"
-    bucket_name = "fastapi-app-bucket-varsh"
-    object_key = "roberta_final_checkpoint.zip"
-
-    if os.path.exists(model_dir) and os.path.isdir(model_dir) and os.listdir(model_dir):
-        logging.info("✅ Model already extracted, skipping download.")
-        return
-
-    logging.info("⬇️ Downloading model zip from S3...")
-    s3 = boto3.client("s3")
-    s3.download_file(bucket_name, object_key, zip_path)
-
-    if not zipfile.is_zipfile(zip_path):
-        raise ValueError("❌ Downloaded file is not a valid zip file.")
-
-    logging.info("📦 Unzipping model...")
-    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-        zip_ref.extractall(model_dir)
-
-    logging.info("✅ Model successfully downloaded and extracted.")
 
 ############################################################
 # FASTAPI SETUP
@@ -51,17 +25,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 
 ############################################################
 # OPENAI SETUP
 ############################################################
-client = OpenAI(api_key="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")
+OPENAI_API_KEY = "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"
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 ############################################################
-# LOAD ROBERTA MODEL
+# LOAD LOCALLY BUNDLED ROBERTA MODEL
 ############################################################
-download_model_from_s3()
 model_path = "roberta_final_checkpoint"
 tokenizer = AutoTokenizer.from_pretrained(model_path)
 model = AutoModelForSequenceClassification.from_pretrained(model_path)
@@ -74,7 +48,7 @@ label_mapping = {
 }
 
 ############################################################
-# PARSE STATS FILE
+# PARSE STATS FILE FROM FREESURFER
 ############################################################
 def parse_aseg_stats(stats_path):
     if not os.path.exists(stats_path):
@@ -116,7 +90,7 @@ def handle_other_mri_formats(file_path):
         return None
 
 ############################################################
-# RISK AND MMSE MAPPING
+# DETERMINE GROUND TRUTH RISK
 ############################################################
 def compute_ground_truth_risk(volumes):
     avg_hippo = (volumes["Left"] + volumes["Right"]) / 2
@@ -127,6 +101,9 @@ def compute_ground_truth_risk(volumes):
     else:
         return "High Risk"
 
+############################################################
+# CONVERT HPC => MMSE
+############################################################
 def compute_mmse_value(volumes):
     avg_v = (volumes["Left"] + volumes["Right"]) / 2
     if avg_v >= 3400:
@@ -138,11 +115,14 @@ def compute_mmse_value(volumes):
     else:
         return 20
 
+############################################################
+# CALCULATE ACCURACY
+############################################################
 def calculate_accuracy(predicted_risk, ground_truth_risk):
     return "100%" if predicted_risk == ground_truth_risk else "0%"
 
 ############################################################
-# GENERATE REPORT
+# GENERATE MEDICAL REPORT USING OPENAI
 ############################################################
 def generate_medical_report(volumes):
     prompt = f"""
@@ -221,10 +201,9 @@ async def process_mri(file: UploadFile = File(...)):
         return {"detail": f"Error => {str(e)}"}
 
 ############################################################
-# HEALTH CHECK ROUTE
+# TEST ROUTE
 ############################################################
 @app.get("/")
 def root():
     return {"message": "✅ RoBERTa MMSE Risk Prediction API is running! Supports .stats, .nii, and .nii.gz."}
-
 
