@@ -1,3 +1,4 @@
+
 # syntax=docker/dockerfile:1
 
 FROM python:3.9-slim
@@ -13,14 +14,10 @@ RUN apt-get update && \
 # Install Python dependencies
 COPY requirements.txt ./
 RUN pip install --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt && \
-    pip install awscli boto3
+    pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of the app
+# Copy the entire app and the model folder
 COPY . .
-
-# Create model directory to be populated at runtime
-RUN mkdir -p roberta_final_checkpoint
 
 # Expose port
 ENV PORT=8000
