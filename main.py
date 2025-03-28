@@ -1,3 +1,4 @@
+
 import logging
 import os
 import shutil
@@ -35,7 +36,7 @@ OPENAI_API_KEY = "sk-proj-SuOp_-ILz5hHivnIHRXCgG9MChl9m-6i6YIwxapCadrDiZSTx5RTSE
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 ############################################################
-# DOWNLOAD MODEL FROM PUBLIC S3 URL
+# DOWNLOAD MODEL FROM PUBLIC S3 URL WITH NESTED FIX
 ############################################################
 def download_model_zip():
     model_folder = "roberta_final_checkpoint"
@@ -47,9 +48,16 @@ def download_model_zip():
 
     logging.info("📦 Unzipping model...")
     with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-        zip_ref.extractall(model_folder)
+        zip_ref.extractall("tmp_unzip")
 
     os.remove(zip_path)
+
+    for root, dirs, files in os.walk("tmp_unzip"):
+        if "config.json" in files:
+            shutil.move(root, model_folder)
+            break
+
+    shutil.rmtree("tmp_unzip", ignore_errors=True)
 
     config_path = os.path.join(model_folder, "config.json")
     assert os.path.exists(config_path), "❌ config.json not found after unzip!"
