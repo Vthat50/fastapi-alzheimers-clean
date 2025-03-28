@@ -1,8 +1,9 @@
-
 import logging
 import os
 import shutil
 import json
+import urllib.request
+import zipfile
 import pandas as pd
 import torch
 import numpy as np
@@ -34,7 +35,26 @@ OPENAI_API_KEY = "sk-proj-SuOp_-ILz5hHivnIHRXCgG9MChl9m-6i6YIwxapCadrDiZSTx5RTSE
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 ############################################################
-# LOAD LOCALLY BUNDLED ROBERTA MODEL
+# DOWNLOAD MODEL FROM PUBLIC S3 URL IF NOT ALREADY PRESENT
+############################################################
+def download_model_zip():
+    model_folder = "roberta_final_checkpoint"
+    if not os.path.exists(model_folder):
+        logging.info("⬇️ Downloading model zip from public S3 URL...")
+        url = "https://fastapi-app-bucket-varsh.s3.amazonaws.com/roberta_final_checkpoint.zip"
+        zip_path = "roberta_final_checkpoint.zip"
+        urllib.request.urlretrieve(url, zip_path)
+
+        logging.info("📦 Unzipping model...")
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(model_folder)
+        os.remove(zip_path)
+
+# Run on startup
+download_model_zip()
+
+############################################################
+# LOAD ROBERTA MODEL
 ############################################################
 model_path = "roberta_final_checkpoint"
 tokenizer = AutoTokenizer.from_pretrained(model_path)
@@ -206,4 +226,5 @@ async def process_mri(file: UploadFile = File(...)):
 @app.get("/")
 def root():
     return {"message": "✅ RoBERTa MMSE Risk Prediction API is running! Supports .stats, .nii, and .nii.gz."}
+
 
