@@ -31,7 +31,7 @@ logging.basicConfig(level=logging.DEBUG)
 ############################################################
 # OPENAI SETUP
 ############################################################
-OPENAI_API_KEY = "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"
+OPENAI_API_KEY = "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"
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 ############################################################
