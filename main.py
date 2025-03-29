@@ -1,198 +1,159 @@
-import logging
 import os
 import shutil
-import urllib.request
-import zipfile
-import torch
-import numpy as np
-import nibabel as nib
-from fastapi import FastAPI, File, UploadFile
+import subprocess
+from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
-from openai import OpenAI
-import sendgrid
-from sendgrid.helpers.mail import Mail
+from typing import Optional
 
-# === FastAPI Setup ===
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://nurodot-com.webflow.io"],
+    allow_origins=["*"],  # adjust in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-logging.basicConfig(level=logging.DEBUG)
+UPLOAD_DIR = "/tmp/uploads"
+FASTSURFER_INPUT = os.path.expanduser("~/fastsurfer-input")
+FASTSURFER_OUTPUT = os.path.expanduser("~/fastsurfer-output")
 
-# === API Key Setup ===
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
-if not OPENAI_API_KEY:
-    raise ValueError("❌ OPENAI_API_KEY missing")
-if not SENDGRID_API_KEY:
-    raise ValueError("❌ SENDGRID_API_KEY missing")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(FASTSURFER_INPUT, exist_ok=True)
+os.makedirs(FASTSURFER_OUTPUT, exist_ok=True)
 
-client = OpenAI(api_key=OPENAI_API_KEY)
 
-# === Email: Send Test Link ===
-def send_test_email(email: str, test_type: str):
-    test_link = f"https://nurodot-com.webflow.io/{test_type.lower()}-form"
-    sg = sendgrid.SendGridAPIClient(SENDGRID_API_KEY)
-    message = Mail(
-        from_email='noreply@alzapi.com',
-        to_emails=email,
-        subject=f"🧠 Your {test_type} Cognitive Test",
-        html_content=f"""
-        Hello,<br><br>
-        Please complete your {test_type} test here:<br>
-        <a href="{test_link}">{test_link}</a><br><br>
-        After completion, return to the website to submit your score.<br><br>
-        Your doctor will receive an analysis.<br><br>
-        - Alzheimer's AI Assistant
-        """
-    )
-    sg.send(message)
+def run_fastsurfer(nifti_path: str, subject_id: str = "sub-01"):
+    input_path = os.path.join(FASTSURFER_INPUT, f"{subject_id}_T1w.nii.gz")
+    shutil.copy(nifti_path, input_path)
 
-class EmailRequest(BaseModel):
-    email: str
-    test_type: str
+    docker_cmd = [
+        "docker", "run", "--rm", "--gpus", "all",
+        "-v", f"{FASTSURFER_INPUT}:/data:ro",
+        "-v", f"{FASTSURFER_OUTPUT}:/output",
+        "-e", "SUBJECTS_DIR=/output",
+        "deepmi/fastsurfer:cu124-v2.3.3",
+        "--t1", f"/data/{subject_id}_T1w.nii.gz",
+        "--sid", subject_id,
+        "--sd", "/output",
+        "--parallel", "--seg_only", "--allow_root"
+    ]
+    subprocess.run(docker_cmd, check=True)
 
-@app.post("/send-cognitive-test/")
-def send_cognitive_test(request: EmailRequest):
-    if request.test_type not in ["MMSE", "MoCA"]:
-        return {"error": "Invalid test type."}
-    send_test_email(request.email, request.test_type)
-    return {"message": f"✅ Sent {request.test_type} test to {request.email}"}
 
-# === Download Model from S3 ===
-def download_model_zip():
-    model_folder = "roberta_final_checkpoint"
-    zip_path = "roberta_final_checkpoint.zip"
-    url = "https://fastapi-app-bucket-varsh.s3.amazonaws.com/roberta_final_checkpoint.zip"
-    urllib.request.urlretrieve(url, zip_path)
-    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-        zip_ref.extractall("tmp_unzip")
-    os.remove(zip_path)
-    for root, _, files in os.walk("tmp_unzip"):
-        if "config.json" in files:
-            shutil.move(root, model_folder)
-            break
-    shutil.rmtree("tmp_unzip", ignore_errors=True)
+def parse_stats(subject_id):
+    stats_dir = os.path.join(FASTSURFER_OUTPUT, subject_id, "stats")
+    aseg_path = os.path.join(stats_dir, "aseg+DKT.stats")
+    lh_aparc_path = os.path.join(stats_dir, "lh.aparc.stats")
 
-download_model_zip()
-
-# === Load Model ===
-model_path = "roberta_final_checkpoint"
-tokenizer = AutoTokenizer.from_pretrained(model_path)
-model = AutoModelForSequenceClassification.from_pretrained(model_path)
-model.eval()
-label_mapping = {0: "Low Risk", 1: "Medium Risk", 2: "High Risk"}
-
-# === MRI Processing ===
-def parse_aseg_stats(path):
-    left = right = None
-    with open(path, "r") as f:
-        for line in f:
-            if "Left-Hippocampus" in line:
-                left = float(line.split()[3])
-            if "Right-Hippocampus" in line:
-                right = float(line.split()[3])
-    return {"Left": float(left), "Right": float(right)} if left and right else None
-
-def handle_other_mri_formats(path):
-    img = nib.load(path)
-    data = img.get_fdata()
-    left = np.sum(data[30:50, 40:60, 20:40] > np.percentile(data, 95)) * np.prod(img.header.get_zooms())
-    right = np.sum(data[60:80, 40:60, 20:40] > np.percentile(data, 95)) * np.prod(img.header.get_zooms())
-    return {"Left": float(round(left, 2)), "Right": float(round(right, 2))}
-
-def compute_mmse(volumes):
-    avg = (volumes["Left"] + volumes["Right"]) / 2
-    return 29 if avg >= 3400 else 26 if avg >= 2900 else 22 if avg >= 2500 else 20
-
-def risk_from_volumes(vol):
-    avg = (vol["Left"] + vol["Right"]) / 2
-    return "Low Risk" if avg >= 3400 else "Medium Risk" if avg >= 2900 else "High Risk"
-
-def generate_medical_report(volumes):
-    prompt = f"""
-    A patient's hippocampal volumes:
-    - Left: {volumes['Left']} mm³
-    - Right: {volumes['Right']} mm³
-
-    Please generate:
-    - Risk assessment
-    - Signs of degeneration
-    - Treatment & follow-up
-    - Suggested diagnostic tests
-    - Markdown formatting
-    """
-    response = client.chat.completions.create(
-        model="gpt-4-turbo",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=1600,
-    )
-    return response.choices[0].message.content.strip()
-
-@app.post("/process-mri/")
-async def process_mri(file: UploadFile = File(...)):
-    path = f"/tmp/{file.filename}"
-    with open(path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    volumes = parse_aseg_stats(path) if path.endswith(".stats") else handle_other_mri_formats(path)
-    if not volumes:
-        return {"detail": "Volume extraction failed"}
-    mmse = compute_mmse(volumes)
-    risk_true = risk_from_volumes(volumes)
-    input_text = f"MMSE score is {mmse}."
-    tokens = tokenizer(input_text, return_tensors="pt")
-    logits = model(**tokens).logits
-    probs = torch.softmax(logits, dim=1).detach().numpy()[0]
-    prediction = label_mapping[int(np.argmax(probs))]
-    return {
-        "MRI Biomarkers": volumes,
-        "MMSE Value": float(mmse),
-        "Predicted Risk": prediction,
-        "Ground Truth Risk": risk_true,
-        "Accuracy Score": "100%" if prediction == risk_true else "0%",
-        "Model Probabilities": {
-            "Low Risk": float(round(probs[0], 4)),
-            "Medium Risk": float(round(probs[1], 4)),
-            "High Risk": float(round(probs[2], 4))
-        },
-        "Generated Medical Report": generate_medical_report(volumes)
+    metrics = {
+        "Left-Hippocampus": None,
+        "Right-Hippocampus": None,
+        "Left-Lateral-Ventricle": None,
+        "Right-Lateral-Ventricle": None,
+        "Left-Cerebral-White-Matter": None,
+        "Right-Cerebral-White-Matter": None,
+        "ctx-lh": None,
+        "ctx-rh": None
     }
 
-# === Analyze MMSE / MoCA ===
-class CognitiveTestInput(BaseModel):
-    patient_name: str
-    test_type: str
-    score: int
+    with open(aseg_path) as f:
+        for line in f:
+            if line.startswith("#"): continue
+            parts = line.strip().split()
+            if len(parts) < 5: continue
+            structure = parts[4]
+            volume = float(parts[3])
+            if structure in metrics:
+                metrics[structure] = volume
 
-@app.post("/analyze-cognitive-score/")
-def analyze_cognitive_score(data: CognitiveTestInput):
-    prompt = f"""
-    Patient: {data.patient_name}
-    Test: {data.test_type}
-    Score: {data.score}
+    thickness = []
+    if os.path.exists(lh_aparc_path):
+        with open(lh_aparc_path) as f:
+            for line in f:
+                if line.startswith("#"): continue
+                parts = line.strip().split()
+                if len(parts) >= 6:
+                    try:
+                        thickness.append(float(parts[5]))
+                    except:
+                        continue
 
-    Please provide:
-    - What this score indicates
-    - Affected cognitive domains
-    - Follow-up recommendations
-    - Alzheimer's relevance
-    """
-    response = client.chat.completions.create(
-        model="gpt-4-turbo",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=1000,
-    )
-    return {"report": response.choices[0].message.content.strip()}
+    ctx_left = metrics.get("ctx-lh")
+    ctx_right = metrics.get("ctx-rh")
+    wm_left = metrics.get("Left-Cerebral-White-Matter")
+    wm_right = metrics.get("Right-Cerebral-White-Matter")
+    lh = metrics.get("Left-Hippocampus")
+    rh = metrics.get("Right-Hippocampus")
+    lv = metrics.get("Left-Lateral-Ventricle")
+    rv = metrics.get("Right-Lateral-Ventricle")
+
+    hip_asym = abs(lh - rh) / max(lh, rh) if lh and rh else None
+    evans_index = (lv + rv) / (lh + rh + 1e-6) if lh and rh else None
+    avg_thickness = round(sum(thickness) / len(thickness), 2) if thickness else None
+
+    return {
+        "Left Hippocampus": lh,
+        "Right Hippocampus": rh,
+        "Asymmetry Index": round(hip_asym, 2) if hip_asym else None,
+        "Evans Index": round(evans_index, 2) if evans_index else None,
+        "Left Cortex Volume": ctx_left,
+        "Right Cortex Volume": ctx_right,
+        "Left WM Volume": wm_left,
+        "Right WM Volume": wm_right,
+        "Average Cortical Thickness": avg_thickness
+    }
+
+
+def predict_stage(mmse: int, cdr: float, adas: float) -> str:
+    if cdr >= 1 or mmse < 21 or adas > 35:
+        return "Alzheimer's"
+    elif 0.5 <= cdr < 1 or 21 <= mmse < 26:
+        return "MCI"
+    elif cdr == 0 and mmse >= 26:
+        return "Normal"
+    else:
+        return "Uncertain"
+
+
+class ScoreInput(BaseModel):
+    mmse: int
+    cdr: float
+    adas_cog: float
+
+
+@app.post("/analyze-mri/")
+async def analyze_mri(file: UploadFile = File(...),
+                      mmse: int = Form(...),
+                      cdr: float = Form(...),
+                      adas_cog: float = Form(...)):
+
+    filename = os.path.join(UPLOAD_DIR, file.filename)
+    with open(filename, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    # Run FastSurfer
+    run_fastsurfer(filename, subject_id="sub-01")
+
+    # Extract biomarkers
+    biomarkers = parse_stats("sub-01")
+
+    # Predict stage
+    stage = predict_stage(mmse, cdr, adas_cog)
+
+    return {
+        "🧠 Clinical Biomarkers": biomarkers,
+        "📈 Cognitive Scores": {
+            "MMSE": mmse,
+            "CDR": cdr,
+            "ADAS-Cog": adas_cog
+        },
+        "🧬 Disease Stage": stage
+    }
+
 
 @app.get("/")
 def root():
-    return {"message": "✅ FastAPI: MRI + MMSE/MoCA Cognitive Risk API Live"}
-
+    return {"message": "✅ FastAPI with FastSurfer GPU MRI Biomarker Analysis"}
