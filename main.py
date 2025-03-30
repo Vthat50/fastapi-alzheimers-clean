@@ -1,10 +1,10 @@
-import os, shutil, subprocess, base64, io, time, requests
+import os, shutil, subprocess, base64, io
 from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from fpdf import FPDF
 from pydantic import BaseModel
 from typing import Optional
+from fpdf import FPDF
 from openai import OpenAI
 import sendgrid
 from sendgrid.helpers.mail import Mail, Attachment, FileContent, FileName, FileType, Disposition
@@ -13,7 +13,7 @@ from sendgrid.helpers.mail import Mail, Attachment, FileContent, FileName, FileT
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # restrict in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"]
@@ -24,21 +24,31 @@ SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 UPLOAD_DIR = "/tmp/uploads"
-FASTSURFER_OUTPUT = os.path.expanduser("~/fastsurfer-output")  # Should match local
+FASTSURFER_INPUT = os.path.expanduser("~/fastsurfer-input")
+FASTSURFER_OUTPUT = os.path.expanduser("~/fastsurfer-output")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(FASTSURFER_INPUT, exist_ok=True)
+os.makedirs(FASTSURFER_OUTPUT, exist_ok=True)
 
-# === SEND TO LOCAL FASTSURFER ===
-NGROK_FSTS_URL = "https://9153-73-223-199-112.ngrok-free.app/run-fastsurfer/"
+# === Run FastSurfer (you must run Docker manually on local machine) ===
+def run_fastsurfer(nifti_path: str, subject_id: str):
+    input_path = os.path.join(FASTSURFER_INPUT, f"{subject_id}_T1w.nii.gz")
+    shutil.copy(nifti_path, input_path)
+    print(f"🧠 FastSurfer input copied to: {input_path}")
+    print("⚠️ NOW RUN THIS MANUALLY IN TERMINAL:")
+    print(f"""
+docker run --rm --gpus all --user root \\
+  -v {FASTSURFER_INPUT}:/data:ro \\
+  -v {FASTSURFER_OUTPUT}:/output \\
+  -e SUBJECTS_DIR=/output \\
+  deepmi/fastsurfer:cu124-v2.3.3 \\
+  --t1 /data/{subject_id}_T1w.nii.gz \\
+  --sid {subject_id} \\
+  --sd /output \\
+  --parallel --seg_only --allow_root
+    """)
 
-def send_mri_to_local(nifti_path):
-    with open(nifti_path, "rb") as f:
-        files = {'file': ("sub-01_T1w.nii.gz", f, "application/gzip")}
-        res = requests.post(NGROK_FSTS_URL, files=files)
-    if res.status_code != 200:
-        raise Exception(f"FastSurfer failed: {res.text}")
-    print("✅ FastSurfer ran successfully via ngrok")
-
-# === Parse biomarkers ===
+# === Parse FastSurfer .stats output ===
 def parse_stats(subject_id):
     stats_dir = os.path.join(FASTSURFER_OUTPUT, subject_id, "stats")
     aseg = os.path.join(stats_dir, "aseg+DKT.stats")
@@ -86,7 +96,7 @@ def parse_stats(subject_id):
         "Average Cortical Thickness": round(sum(thickness)/len(thickness), 2) if thickness else None
     }
 
-# === Predict stage ===
+# === Predict disease stage ===
 def predict_stage(mmse, cdr, adas):
     if cdr >= 1 or mmse < 21 or adas > 35:
         return "Alzheimer's"
@@ -96,7 +106,7 @@ def predict_stage(mmse, cdr, adas):
         return "Normal"
     return "Uncertain"
 
-# === GPT Summary ===
+# === GPT Summary Generation ===
 def generate_summary(biomarkers, mmse, cdr, adas):
     prompt = f"""Patient MRI & cognitive results:
 - Left Hippocampus: {biomarkers['Left Hippocampus']} mm³
@@ -119,7 +129,7 @@ Generate:
     )
     return response.choices[0].message.content.strip()
 
-# === PDF Report ===
+# === PDF Generation ===
 def create_pdf(summary_text):
     pdf = FPDF()
     pdf.add_page()
@@ -155,32 +165,29 @@ def send_email_report(email, pdf_bytes, segmentation_b64):
     message.attachment = attachment
     sg.send(message)
 
-# === MAIN Endpoint ===
+# === Endpoint to receive MRI and email ===
 @app.post("/analyze-mri/")
 async def analyze_mri(file: UploadFile = File(...),
                       mmse: int = Form(...),
                       cdr: float = Form(...),
                       adas_cog: float = Form(...),
                       email: str = Form(...)):
-
     subject_id = "sub-01"
     nifti_path = os.path.join(UPLOAD_DIR, file.filename)
     with open(nifti_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
-    # Send to local FastSurfer (via ngrok)
-    send_mri_to_local(nifti_path)
+    run_fastsurfer(nifti_path, subject_id)
 
-    # Wait for stats file to appear
-    stats_dir = os.path.join(FASTSURFER_OUTPUT, subject_id, "stats")
-    timeout = 60
-    while not (os.path.exists(os.path.join(stats_dir, "aseg+DKT.stats")) and os.path.exists(os.path.join(stats_dir, "lh.aparc.stats"))) and timeout > 0:
-        time.sleep(2)
-        timeout -= 2
+    return {"message": "🚀 MRI received. Run FastSurfer locally and refresh for results."}
 
-    if timeout <= 0:
-        return JSONResponse(status_code=500, content={"detail": "Timed out waiting for FastSurfer results."})
-
+# === Endpoint to analyze completed FastSurfer .stats files ===
+@app.post("/analyze-from-stats/")
+async def analyze_after_local_docker(mmse: int = Form(...),
+                                     cdr: float = Form(...),
+                                     adas_cog: float = Form(...),
+                                     email: str = Form(...)):
+    subject_id = "sub-01"
     biomarkers = parse_stats(subject_id)
     stage = predict_stage(mmse, cdr, adas_cog)
     summary = generate_summary(biomarkers, mmse, cdr, adas_cog)
@@ -201,6 +208,21 @@ async def analyze_mri(file: UploadFile = File(...),
         "🧠 Brain Segmentation Preview (base64)": seg_base64
     }
 
+# === Optional: Endpoint for cognitive-only score processing ===
+class ScoreInput(BaseModel):
+    patient_name: str
+    patient_email: str
+    mmse: int
+    cdr: float
+
+@app.post("/analyze-cognitive-score/")
+def analyze_score(input: ScoreInput):
+    mmse, cdr = input.mmse, input.cdr
+    adas_cog = 25  # placeholder default
+    stage = predict_stage(mmse, cdr, adas_cog)
+    summary = generate_summary({}, mmse, cdr, adas_cog)
+    return {"stage": stage, "report": summary}
+
 @app.get("/")
 def root():
-    return {"message": "✅ FastAPI + Local FastSurfer + PDF + Email + Ngrok bridge working!"}
+    return {"message": "✅ FastAPI MRI + GPT + PDF + Email + Segmentation Preview"}
