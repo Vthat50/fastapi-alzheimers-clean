@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from typing import Optional
 from openai import OpenAI
 import sendgrid
+from fpdf import FPDF
 from sendgrid.helpers.mail import Mail, Attachment, FileContent, FileName, FileType, Disposition
 
 # === App Setup ===
