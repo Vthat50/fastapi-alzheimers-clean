@@ -1,27 +1,19 @@
-# syntax=docker/dockerfile:1
 
+# Use a lightweight Python base image
 FROM python:3.9-slim
 
-# Set work directory
+# Set the working directory inside the container
 WORKDIR /app
 
-# Install system packages
-RUN apt-get update && \
-    apt-get install -y unzip curl && \
-    rm -rf /var/lib/apt/lists/*
+# Copy the requirements.txt and install dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy and install dependencies
-COPY requirements.txt ./
-RUN pip install --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
-
-# Copy app code into container
+# Copy the rest of your app code into the container
 COPY . .
 
-# Set environment variable for FastAPI port
-ENV PORT=8000
-EXPOSE $PORT
+# Expose the port Render expects
+EXPOSE 8000
 
-# Start FastAPI app with Uvicorn
+# Start the FastAPI app using uvicorn
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
-
