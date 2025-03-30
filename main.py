@@ -1,20 +1,16 @@
-import os, shutil, subprocess, base64, io
+import os, base64, io
 from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from fpdf import FPDF
 from pydantic import BaseModel
-from typing import Optional
 from openai import OpenAI
 import sendgrid
-from fpdf import FPDF
 from sendgrid.helpers.mail import Mail, Attachment, FileContent, FileName, FileType, Disposition
 
-# === App Setup ===
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # restrict in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"]
@@ -24,38 +20,13 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-UPLOAD_DIR = "/tmp/uploads"
-FASTSURFER_INPUT = os.path.expanduser("~/fastsurfer-input")
-FASTSURFER_OUTPUT = os.path.expanduser("~/fastsurfer-output")
+UPLOAD_DIR = "/tmp/stats"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.makedirs(FASTSURFER_INPUT, exist_ok=True)
-os.makedirs(FASTSURFER_OUTPUT, exist_ok=True)
 
-# === Run FastSurfer ===
-def run_fastsurfer(nifti_path: str, subject_id: str):
-    input_path = os.path.join(FASTSURFER_INPUT, f"{subject_id}_T1w.nii.gz")
-    shutil.copy(nifti_path, input_path)
-    subprocess.run([
-        "docker", "run", "--rm", "--gpus", "all", "--user", "root",
-        "-v", f"{FASTSURFER_INPUT}:/data:ro",
-        "-v", f"{FASTSURFER_OUTPUT}:/output",
-        "-e", "SUBJECTS_DIR=/output",
-        "deepmi/fastsurfer:cu124-v2.3.3",
-        "--t1", f"/data/{subject_id}_T1w.nii.gz",
-        "--sid", subject_id,
-        "--sd", "/output",
-        "--parallel", "--seg_only", "--allow_root"
-    ], check=True)
-
-# === Parse biomarkers ===
-def parse_stats(subject_id):
-    stats_dir = os.path.join(FASTSURFER_OUTPUT, subject_id, "stats")
-    aseg = os.path.join(stats_dir, "aseg+DKT.stats")
-    aparc = os.path.join(stats_dir, "lh.aparc.stats")
-
+def parse_stats(aseg_path, aparc_path):
     metrics, thickness = {}, []
-    if os.path.exists(aseg):
-        with open(aseg) as f:
+    if os.path.exists(aseg_path):
+        with open(aseg_path) as f:
             for line in f:
                 if line.startswith("#"): continue
                 parts = line.split()
@@ -65,8 +36,8 @@ def parse_stats(subject_id):
                 except: continue
                 metrics[label] = volume
 
-    if os.path.exists(aparc):
-        with open(aparc) as f:
+    if os.path.exists(aparc_path):
+        with open(aparc_path) as f:
             for line in f:
                 if line.startswith("#"): continue
                 parts = line.split()
@@ -95,7 +66,6 @@ def parse_stats(subject_id):
         "Average Cortical Thickness": round(sum(thickness)/len(thickness), 2) if thickness else None
     }
 
-# === Predict stage ===
 def predict_stage(mmse, cdr, adas):
     if cdr >= 1 or mmse < 21 or adas > 35:
         return "Alzheimer's"
@@ -105,7 +75,6 @@ def predict_stage(mmse, cdr, adas):
         return "Normal"
     return "Uncertain"
 
-# === GPT Summary ===
 def generate_summary(biomarkers, mmse, cdr, adas):
     prompt = f"""Patient MRI & cognitive results:
 - Left Hippocampus: {biomarkers['Left Hippocampus']} mm³
@@ -128,7 +97,6 @@ Generate:
     )
     return response.choices[0].message.content.strip()
 
-# === Generate PDF Report ===
 def create_pdf(summary_text):
     pdf = FPDF()
     pdf.add_page()
@@ -140,8 +108,7 @@ def create_pdf(summary_text):
     pdf.output(pdf_output)
     return pdf_output.getvalue()
 
-# === Send Email ===
-def send_email_report(email, pdf_bytes, segmentation_b64):
+def send_email_report(email, pdf_bytes):
     sg = sendgrid.SendGridAPIClient(SENDGRID_API_KEY)
     attachment = Attachment(
         FileContent(base64.b64encode(pdf_bytes).decode()),
@@ -149,57 +116,43 @@ def send_email_report(email, pdf_bytes, segmentation_b64):
         FileType("application/pdf"),
         Disposition("attachment")
     )
-    html_content = f"""
-    <p>Hi,</p>
-    <p>Your MRI report is ready. See attached PDF.</p>
-    <p><img src="data:image/png;base64,{segmentation_b64}" width="400"/></p>
-    <p>Stay healthy,<br>Alzheimer's Risk Platform</p>
-    """
     message = Mail(
         from_email="noreply@alzapi.com",
         to_emails=email,
         subject="🧠 Your Alzheimer's MRI Report",
-        html_content=html_content
+        html_content="Your report is attached as a PDF."
     )
     message.attachment = attachment
     sg.send(message)
 
-# === Endpoint ===
-@app.post("/analyze-mri/")
-async def analyze_mri(file: UploadFile = File(...),
-                      mmse: int = Form(...),
-                      cdr: float = Form(...),
-                      adas_cog: float = Form(...),
-                      email: str = Form(...)):
+@app.post("/upload-stats/")
+async def upload_stats(aseg: UploadFile = File(...),
+                       aparc: UploadFile = File(...),
+                       mmse: int = Form(...),
+                       cdr: float = Form(...),
+                       adas: float = Form(...),
+                       email: str = Form(...)):
+    aseg_path = os.path.join(UPLOAD_DIR, "aseg+DKT.stats")
+    aparc_path = os.path.join(UPLOAD_DIR, "lh.aparc.stats")
+    with open(aseg_path, "wb") as f:
+        f.write(await aseg.read())
+    with open(aparc_path, "wb") as f:
+        f.write(await aparc.read())
 
-    subject_id = "sub-01"
-    nifti_path = os.path.join(UPLOAD_DIR, file.filename)
-    with open(nifti_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
-
-    run_fastsurfer(nifti_path, subject_id)
-    biomarkers = parse_stats(subject_id)
-    stage = predict_stage(mmse, cdr, adas_cog)
-    summary = generate_summary(biomarkers, mmse, cdr, adas_cog)
+    biomarkers = parse_stats(aseg_path, aparc_path)
+    stage = predict_stage(mmse, cdr, adas)
+    summary = generate_summary(biomarkers, mmse, cdr, adas)
     pdf = create_pdf(summary)
-
-    seg_path = os.path.join(FASTSURFER_OUTPUT, subject_id, "mri", "aparc+aseg.png")
-    with open(seg_path, "rb") as f:
-        seg_base64 = base64.b64encode(f.read()).decode()
-
-    send_email_report(email, pdf, seg_base64)
+    send_email_report(email, pdf)
 
     return {
         "🧠 Clinical Biomarkers": biomarkers,
-        "📈 Cognitive Scores": {"MMSE": mmse, "CDR": cdr, "ADAS-Cog": adas_cog},
+        "📈 Cognitive Scores": {"MMSE": mmse, "CDR": cdr, "ADAS-Cog": adas},
         "🧬 Disease Stage": stage,
         "📋 GPT Summary": summary,
-        "🧾 PDF Report": "✅ Sent to email",
-        "🧠 Brain Segmentation Preview (base64)": seg_base64
+        "🧾 PDF Report": "✅ Sent to email"
     }
 
 @app.get("/")
 def root():
-    return {"message": "✅ FastAPI MRI + GPT + PDF + Email + Segmentation Preview"}
-
-
+    return {"message": "✅ Cloud backend ready to parse FastSurfer .stats and email reports"}
