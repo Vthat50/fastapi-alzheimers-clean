@@ -112,3 +112,5 @@ openai>=1.14.2
 python-multipart
 sendgrid==6.11.0
 pydantic==2.6.4
+fpdf
+
