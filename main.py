@@ -4,13 +4,14 @@ import subprocess
 from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail
 
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # adjust in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -23,7 +24,6 @@ FASTSURFER_OUTPUT = os.path.expanduser("~/fastsurfer-output")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(FASTSURFER_INPUT, exist_ok=True)
 os.makedirs(FASTSURFER_OUTPUT, exist_ok=True)
-
 
 def run_fastsurfer(nifti_path: str, subject_id: str = "sub-01"):
     input_path = os.path.join(FASTSURFER_INPUT, f"{subject_id}_T1w.nii.gz")
@@ -41,7 +41,6 @@ def run_fastsurfer(nifti_path: str, subject_id: str = "sub-01"):
         "--parallel", "--seg_only", "--allow_root"
     ]
     subprocess.run(docker_cmd, check=True)
-
 
 def parse_stats(subject_id):
     stats_dir = os.path.join(FASTSURFER_OUTPUT, subject_id, "stats")
@@ -81,14 +80,10 @@ def parse_stats(subject_id):
                     except:
                         continue
 
-    ctx_left = metrics.get("ctx-lh")
-    ctx_right = metrics.get("ctx-rh")
-    wm_left = metrics.get("Left-Cerebral-White-Matter")
-    wm_right = metrics.get("Right-Cerebral-White-Matter")
-    lh = metrics.get("Left-Hippocampus")
-    rh = metrics.get("Right-Hippocampus")
-    lv = metrics.get("Left-Lateral-Ventricle")
-    rv = metrics.get("Right-Lateral-Ventricle")
+    lh = metrics["Left-Hippocampus"]
+    rh = metrics["Right-Hippocampus"]
+    lv = metrics["Left-Lateral-Ventricle"]
+    rv = metrics["Right-Lateral-Ventricle"]
 
     hip_asym = abs(lh - rh) / max(lh, rh) if lh and rh else None
     evans_index = (lv + rv) / (lh + rh + 1e-6) if lh and rh else None
@@ -99,13 +94,12 @@ def parse_stats(subject_id):
         "Right Hippocampus": rh,
         "Asymmetry Index": round(hip_asym, 2) if hip_asym else None,
         "Evans Index": round(evans_index, 2) if evans_index else None,
-        "Left Cortex Volume": ctx_left,
-        "Right Cortex Volume": ctx_right,
-        "Left WM Volume": wm_left,
-        "Right WM Volume": wm_right,
+        "Left Cortex Volume": metrics["ctx-lh"],
+        "Right Cortex Volume": metrics["ctx-rh"],
+        "Left WM Volume": metrics["Left-Cerebral-White-Matter"],
+        "Right WM Volume": metrics["Right-Cerebral-White-Matter"],
         "Average Cortical Thickness": avg_thickness
     }
-
 
 def predict_stage(mmse: int, cdr: float, adas: float) -> str:
     if cdr >= 1 or mmse < 21 or adas > 35:
@@ -117,43 +111,69 @@ def predict_stage(mmse: int, cdr: float, adas: float) -> str:
     else:
         return "Uncertain"
 
+def send_summary_email(report):
+    api_key = os.getenv("SENDGRID_API_KEY")
+    doctor_email = os.getenv("DOCTOR_EMAIL", "doctor@example.com")
+
+    if api_key:
+        message = Mail(
+            from_email="noreply@alzheimers.ai",
+            to_emails=doctor_email,
+            subject="🧠 Cognitive Test Results",
+            html_content=report.replace("\n", "<br>")
+        )
+        try:
+            sg = SendGridAPIClient(api_key)
+            sg.send(message)
+            print("✅ Email sent.")
+        except Exception as e:
+            print("❌ Email failed:", str(e))
 
 class ScoreInput(BaseModel):
     mmse: int
     cdr: float
     adas_cog: float
 
-
 @app.post("/analyze-mri/")
-async def analyze_mri(file: UploadFile = File(...),
-                      mmse: int = Form(...),
-                      cdr: float = Form(...),
-                      adas_cog: float = Form(...)):
-
+async def analyze_mri(file: UploadFile = File(...)):
     filename = os.path.join(UPLOAD_DIR, file.filename)
     with open(filename, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
-    # Run FastSurfer
     run_fastsurfer(filename, subject_id="sub-01")
-
-    # Extract biomarkers
     biomarkers = parse_stats("sub-01")
-
-    # Predict stage
-    stage = predict_stage(mmse, cdr, adas_cog)
 
     return {
         "🧠 Clinical Biomarkers": biomarkers,
-        "📈 Cognitive Scores": {
-            "MMSE": mmse,
-            "CDR": cdr,
-            "ADAS-Cog": adas_cog
-        },
-        "🧬 Disease Stage": stage
+        "message": "MRI scan complete. Please continue to cognitive testing."
     }
 
+@app.post("/analyze-cognitive-score/")
+async def analyze_cognitive_score(input: ScoreInput):
+    mmse = input.mmse
+    cdr = input.cdr
+    adas = input.adas_cog
+    stage = predict_stage(mmse, cdr, adas)
+
+    report = (
+        f"📝 Cognitive Test Summary:\n"
+        f"- MMSE: {mmse}/30\n"
+        f"- CDR: {cdr}\n"
+        f"- ADAS-Cog: {adas}\n\n"
+        f"🧬 Predicted Stage: {stage}"
+    )
+
+    send_summary_email(report)
+
+    return {
+        "mmse": mmse,
+        "cdr": cdr,
+        "adas": adas,
+        "stage": stage,
+        "report": report
+    }
 
 @app.get("/")
 def root():
-    return {"message": "✅ FastAPI with FastSurfer GPU MRI Biomarker Analysis"}
+    return {"message": "✅ FastAPI MRI + Cognitive Test + Summary Report API"}
+
