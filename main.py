@@ -30,12 +30,12 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(FASTSURFER_INPUT, exist_ok=True)
 os.makedirs(FASTSURFER_OUTPUT, exist_ok=True)
 
-# === Save NIfTI + Print Docker command for FastSurfer ===
+# === Run FastSurfer locally ===
 def run_fastsurfer(nifti_path: str, subject_id: str):
     input_path = os.path.join(FASTSURFER_INPUT, f"{subject_id}_T1w.nii.gz")
     shutil.copy(nifti_path, input_path)
-    print(f"🧠 Copied MRI to: {input_path}")
-    print("⚠️ NOW RUN THIS IN TERMINAL:")
+    print(f"🧠 FastSurfer input copied to: {input_path}")
+    print("⚠️ NOW RUN THIS MANUALLY IN TERMINAL:")
     print(f"""
 docker run --rm --gpus all --user root \\
   -v {FASTSURFER_INPUT}:/data:ro \\
@@ -48,7 +48,7 @@ docker run --rm --gpus all --user root \\
   --parallel --seg_only --allow_root
     """)
 
-# === Extract biomarkers from FastSurfer stats ===
+# === Parse FastSurfer stats ===
 def parse_stats(subject_id):
     stats_dir = os.path.join(FASTSURFER_OUTPUT, subject_id, "stats")
     aseg = os.path.join(stats_dir, "aseg+DKT.stats")
@@ -96,7 +96,7 @@ def parse_stats(subject_id):
         "Average Cortical Thickness": round(sum(thickness)/len(thickness), 2) if thickness else None
     }
 
-# === Disease stage logic ===
+# === Disease stage prediction ===
 def predict_stage(mmse, cdr, adas):
     if cdr >= 1 or mmse < 21 or adas > 35:
         return "Alzheimer's"
@@ -106,7 +106,7 @@ def predict_stage(mmse, cdr, adas):
         return "Normal"
     return "Uncertain"
 
-# === GPT clinical summary ===
+# === GPT summary ===
 def generate_summary(biomarkers, mmse, cdr, adas):
     prompt = f"""Patient MRI & cognitive results:
 - Left Hippocampus: {biomarkers['Left Hippocampus']} mm³
@@ -129,7 +129,7 @@ Generate:
     )
     return response.choices[0].message.content.strip()
 
-# === Create PDF report ===
+# === PDF generator ===
 def create_pdf(summary_text):
     pdf = FPDF()
     pdf.add_page()
@@ -141,7 +141,7 @@ def create_pdf(summary_text):
     pdf.output(pdf_output)
     return pdf_output.getvalue()
 
-# === Email PDF + segmentation preview ===
+# === Email the PDF + segmentation ===
 def send_email_report(email, pdf_bytes, segmentation_b64):
     sg = sendgrid.SendGridAPIClient(SENDGRID_API_KEY)
     attachment = Attachment(
@@ -153,7 +153,7 @@ def send_email_report(email, pdf_bytes, segmentation_b64):
     html_content = f"""
     <p>Hi,</p>
     <p>Your MRI report is ready. See attached PDF.</p>
-    <p><img src="data:image/png;base64,{segmentation_b64}" width="400"/></p>
+    <p><img src=\"data:image/png;base64,{segmentation_b64}\" width=\"400\"/></p>
     <p>Stay healthy,<br>Alzheimer's Risk Platform</p>
     """
     message = Mail(
@@ -165,7 +165,6 @@ def send_email_report(email, pdf_bytes, segmentation_b64):
     message.attachment = attachment
     sg.send(message)
 
-# === Step 1: Upload MRI, wait for manual FastSurfer ===
 @app.post("/analyze-mri/")
 async def analyze_mri(file: UploadFile = File(...),
                       mmse: int = Form(...),
@@ -178,20 +177,15 @@ async def analyze_mri(file: UploadFile = File(...),
         shutil.copyfileobj(file.file, f)
 
     run_fastsurfer(nifti_path, subject_id)
-    return {"message": "📤 MRI uploaded. Run FastSurfer manually on your machine."}
+    return {"message": "🧠 MRI uploaded. Please run FastSurfer manually, then hit /get-results"}
 
-# === Step 2: Finish analysis from stats after local Docker ===
-@app.post("/analyze-from-stats/")
-async def analyze_after_local_docker(mmse: int = Form(...),
-                                     cdr: float = Form(...),
-                                     adas_cog: float = Form(...),
-                                     email: str = Form(...)):
+@app.post("/get-results")
+async def get_results(mmse: int = Form(...), cdr: float = Form(...), adas_cog: float = Form(...), email: str = Form(...)):
     subject_id = "sub-01"
     biomarkers = parse_stats(subject_id)
     stage = predict_stage(mmse, cdr, adas_cog)
     summary = generate_summary(biomarkers, mmse, cdr, adas_cog)
     pdf = create_pdf(summary)
-
     seg_path = os.path.join(FASTSURFER_OUTPUT, subject_id, "mri", "aparc+aseg.png")
     with open(seg_path, "rb") as f:
         seg_base64 = base64.b64encode(f.read()).decode()
@@ -207,21 +201,6 @@ async def analyze_after_local_docker(mmse: int = Form(...),
         "🧠 Brain Segmentation Preview (base64)": seg_base64
     }
 
-# === Optional: For cognitive test only ===
-class ScoreInput(BaseModel):
-    patient_name: str
-    patient_email: str
-    mmse: int
-    cdr: float
-
-@app.post("/analyze-cognitive-score/")
-def analyze_score(input: ScoreInput):
-    mmse, cdr = input.mmse, input.cdr
-    adas_cog = 25  # placeholder
-    stage = predict_stage(mmse, cdr, adas_cog)
-    summary = generate_summary({}, mmse, cdr, adas_cog)
-    return {"stage": stage, "report": summary}
-
 @app.get("/")
 def root():
-    return {"message": "✅ MRI + FastSurfer + GPT summary + Email working"}
+    return {"message": "✅ FastAPI MRI Analyzer ready. Upload .nii.gz and run FastSurfer locally."}
