@@ -5,20 +5,21 @@ from fastapi.responses import JSONResponse
 from fpdf import FPDF
 from openai import OpenAI
 
-# Environment
+# Load API key
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# App setup
+# FastAPI setup
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Or set to your frontend origin
+    allow_origins=["*"],  # Allow all or restrict to your frontend URL
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"]
 )
 
+# Upload folder
 UPLOAD_DIR = "/tmp/uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
@@ -33,14 +34,13 @@ async def analyze(file: UploadFile = File(...),
                   adas_cog: float = Form(...),
                   email: str = Form(...)):
 
-    subject_id = "sub-01"
     filepath = os.path.join(UPLOAD_DIR, file.filename)
     with open(filepath, "wb") as f:
         f.write(await file.read())
 
-    # Instructions to user (e.g. your own terminal) to run FastSurfer locally
+    # MRI file saved. You’ll run FastSurfer manually on your local machine.
     return {
-        "message": "🧠 MRI uploaded. Run FastSurfer locally, then send results via POST to /get-results"
+        "message": "🧠 MRI uploaded. Now run FastSurfer locally, then POST results to /get-results/"
     }
 
 @app.post("/get-results/")
@@ -48,7 +48,7 @@ async def get_results(mmse: int = Form(...),
                       cdr: float = Form(...),
                       adas_cog: float = Form(...)):
 
-    # Simulate stats parsed from FastSurfer output (replace with actual parser later)
+    # Replace this with real FastSurfer stats sent from local machine
     biomarkers = {
         "Left Hippocampus": 2200.0,
         "Right Hippocampus": 2100.0,
@@ -58,8 +58,8 @@ async def get_results(mmse: int = Form(...),
     }
 
     summary = generate_summary(biomarkers, mmse, cdr, adas_cog)
-    pdf = create_pdf(summary)
-    encoded_pdf = base64.b64encode(pdf).decode()
+    pdf_bytes = create_pdf(summary)
+    encoded_pdf = base64.b64encode(pdf_bytes).decode()
 
     return {
         "🧠 Clinical Biomarkers": biomarkers,
@@ -68,6 +68,8 @@ async def get_results(mmse: int = Form(...),
         "📋 GPT Summary": summary,
         "🧾 PDF Report (base64)": encoded_pdf
     }
+
+# === Utilities ===
 
 def generate_summary(biomarkers, mmse, cdr, adas):
     prompt = f"""Patient MRI & Cognitive Results:
@@ -84,7 +86,7 @@ Please write:
 - Explanation of results
 - Recommendations
 - Markdown format"""
-    
+
     response = client.chat.completions.create(
         model="gpt-4-turbo",
         messages=[{"role": "user", "content": prompt}],
@@ -110,3 +112,4 @@ def predict_stage(mmse, cdr, adas):
     elif cdr == 0 and mmse >= 26:
         return "Normal"
     return "Uncertain"
+
