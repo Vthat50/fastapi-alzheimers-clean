@@ -87,9 +87,10 @@ tensorboard_data_server==0.7.0
 threadpoolctl==3.5.0
 tifffile==2024.8.30
 --extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.6.0
-torchvision==0.21.0
-torchaudio==2.6.0
+torch==2.2.1
+torchvision==0.17.1
+torchaudio==2.2.1
+
 tornado==6.4.2
 tqdm==4.67.1
 triton==3.2.0
